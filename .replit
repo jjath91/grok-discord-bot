@@ -13,3 +13,7 @@ channel = "stable-23_11"
 [[ports]]
 localPort = 8080
 externalPort = 80
+
+[deployment]
+run = ["python3", "main.py"]
+deploymentTarget = "cloudrun"
