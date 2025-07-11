@@ -1,15 +1,15 @@
+# The command to run your bot
+run = "python3 main.py"
+
+# Specifies the file that contains your main code
 entrypoint = "main.py"
 modules = ["python-3.11"]
-
-[nix]
-channel = "stable-24_05"
-
-[unitTest]
 language = "python3"
 
-[gitHubImport]
-requiredFiles = [".replit", "replit.nix"]
+[nix]
+# Uses a recent, stable Nix channel which provides Python and other tools
+channel = "stable-23_11"
 
-[deployment]
-run = ["python3", "main.py"]
-deploymentTarget = "cloudrun"
+[[ports]]
+localPort = 8080
+externalPort = 80
