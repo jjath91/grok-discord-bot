@@ -1,7 +1,3 @@
-"""
-Grok Discord Bot - xAI API Integration
-A Discord bot powered by Grok with web search and current datetime tools.
-"""
 import discord
 from discord.ext import commands
 import aiohttp
@@ -35,10 +31,27 @@ GROK_API_KEY = os.environ.get('GROK_API_KEY')
 GROK_API_URL = 'https://api.x.ai/v1/chat/completions'
 GROK_MODEL = 'grok-4'  # Latest Grok-4 model as of late 2025
 
-SYSTEM_PROMPT = """You are Grok, a helpful AI companion in a Discord Server."""
+SYSTEM_PROMPT = """You are Grok, a helpful and knowledgeable AI assistant in a Discord server.
+
+Your communication style:
+- Be helpful, informative, and conversational
+- Keep responses concise (2-4 sentences when possible)
+- Use a friendly but professional tone
+- You can be witty and have personality, but avoid crude or juvenile humor
+- When users ask unclear questions, ask for clarification politely
+- Focus on actually answering questions rather than making jokes about them
+- If you don't understand something, say so directly without being condescending
+
+Your capabilities:
+- You can search the web for current information
+- You can provide date/time in different timezones
+- You remember context from the conversation
+- You're knowledgeable about many topics
+
+Be genuinely helpful while maintaining an engaging personality."""
 
 MAX_HISTORY = 10
-MAX_REPLY_TOKENS = 500
+MAX_REPLY_TOKENS = 800  # Increased for more complete responses
 MAX_PAYLOAD_CHARS = 8000
 MAX_TOOL_ITERATIONS = 5
 
@@ -188,16 +201,37 @@ class GrokBot(commands.Bot):
         }
 
     def build_messages(self, user_input: str, channel_id: int) -> List[Dict]:
+        """Build message array with proper history including tool calls."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         history = self.conversation_history[channel_id]
         total_chars = len(SYSTEM_PROMPT) + len(user_input)
-        for msg in list(history)[-10:]:  # Safety
-            if total_chars + len(msg.get("content", "")) > MAX_PAYLOAD_CHARS:
+
+        # Add history messages, respecting character limit
+        for msg in list(history):
+            # Calculate size of this message (handle all message types)
+            msg_size = self._estimate_message_size(msg)
+            if total_chars + msg_size > MAX_PAYLOAD_CHARS:
+                logger.warning(f"Payload limit reached, truncating history")
                 break
             messages.append(msg)
-            total_chars += len(msg.get("content", ""))
+            total_chars += msg_size
+
         messages.append({"role": "user", "content": user_input})
         return messages
+
+    def _estimate_message_size(self, msg: Dict) -> int:
+        """Estimate the character size of a message including tool calls."""
+        size = 0
+        # Regular content
+        if "content" in msg and msg["content"]:
+            size += len(str(msg["content"]))
+        # Tool calls in assistant messages
+        if "tool_calls" in msg:
+            size += len(json.dumps(msg["tool_calls"]))
+        # Tool call id in tool response messages
+        if "tool_call_id" in msg:
+            size += len(msg["tool_call_id"])
+        return size
 
 
 bot = GrokBot()
@@ -219,9 +253,20 @@ async def on_message(message: discord.Message):
 
     # Debug command
     if message.content.strip().lower() == '!history':
-        count = len(bot.conversation_history[message.channel.id])
-        await message.channel.send(f"📊 History: {count}/{MAX_HISTORY} messages"
-                                   )
+        history = bot.conversation_history[message.channel.id]
+        count = len(history)
+
+        # Count different message types
+        user_msgs = sum(1 for m in history if m.get("role") == "user")
+        assistant_msgs = sum(1 for m in history
+                             if m.get("role") == "assistant")
+        tool_msgs = sum(1 for m in history if m.get("role") == "tool")
+
+        await message.channel.send(
+            f"📊 **History Stats**\n"
+            f"Total messages: {count}/{MAX_HISTORY}\n"
+            f"User: {user_msgs} | Assistant: {assistant_msgs} | Tool: {tool_msgs}"
+        )
         return
 
     if not bot.user.mentioned_in(message):
@@ -235,8 +280,8 @@ async def on_message(message: discord.Message):
     for mention in [f'<@!{bot.user.id}>', f'<@{bot.user.id}>']:
         user_input = user_input.replace(mention, '').strip()
     if not user_input:
-        await message.channel.send("You pinged me but said nothing, dumbass. 😂"
-                                   )
+        await message.channel.send(
+            "You mentioned me but didn't say anything. How can I help?")
         return
 
     logger.info(f"Processing: {message.author} -> {user_input[:100]}")
@@ -253,7 +298,8 @@ async def on_message(message: discord.Message):
                 "model": GROK_MODEL,
                 "messages": messages,
                 "max_tokens": MAX_REPLY_TOKENS,
-                "temperature": 0.1,
+                "temperature":
+                0.5,  # Balanced for natural but focused responses
                 "tools": TOOLS if DDGS_AVAILABLE else
                 [TOOLS[0]],  # Only datetime if no search
                 "tool_choice": "auto"
@@ -287,26 +333,39 @@ async def on_message(message: discord.Message):
                     data["messages"] = messages
                     continue  # Loop again with tool results
 
-                # Final response
+                # Final response - save this message to the messages array too
                 reply = delta.get("content", "").strip()
+                messages.append(delta)  # Save final assistant response
                 break
             else:
-                reply = "Took too many tool calls. Rephrase your shit."
+                reply = "I had trouble processing that request. Could you rephrase it more simply?"
 
             if reply:
                 if len(reply) > 2000:
                     reply = reply[:1997] + "..."
                 await message.channel.send(reply)
 
-                # Update history
+                # Update history with COMPLETE conversation including tool calls
                 history = bot.conversation_history[message.channel.id]
+
+                # Save the user's input
                 history.append({"role": "user", "content": user_input})
-                history.append({"role": "assistant", "content": reply})
+
+                # Save ALL assistant messages (including those with tool calls) and tool responses
+                # We need to reconstruct what happened during the tool calling loop
+                # Starting from the initial messages we built, find everything after the user input
+                for msg in messages[messages.index({
+                        "role": "user",
+                        "content": user_input
+                }) + 1:]:
+                    # Save assistant messages (with or without tool calls) and tool messages
+                    if msg["role"] in ["assistant", "tool"]:
+                        history.append(msg)
 
         except Exception as e:
             logger.error(f"Unexpected error: {e}", exc_info=True)
             await message.channel.send(
-                "Fuck, something broke on my end. Check logs.")
+                "Sorry, I encountered an unexpected error. Please try again.")
 
 
 # --- KEEP-ALIVE WEB SERVER ---
@@ -318,7 +377,8 @@ def setup_keep_alive():
 
         @app.route('/')
         def home():
-            return f"Grok Bot Online<br>Model: {GROK_MODEL}<br>Web Search: {'Enabled' if DDGS_AVAILABLE else 'Disabled'}"
+            search_status = 'Enabled' if DDGS_AVAILABLE else 'Disabled'
+            return f"Grok Bot Online<br>Model: {GROK_MODEL}<br>Web Search: {search_status}"
 
         def run():
             app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
