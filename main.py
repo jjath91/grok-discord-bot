@@ -15,6 +15,10 @@ from typing import Optional, Dict, List
 from datetime import datetime
 import pytz
 
+# Local modules
+import database
+import profile_generator
+
 # Try to import ddgs for web search
 try:
     from ddgs import DDGS
@@ -125,6 +129,9 @@ class GrokBot(commands.Bot):
         logger.info("Aiohttp session created for Grok API calls")
         if not DDGS_AVAILABLE:
             logger.warning("Web search disabled - ddgs not installed")
+        # Initialize the database
+        await database.init_db()
+        logger.info("Database initialized")
 
     async def on_close(self) -> None:
         if self.session:
@@ -209,11 +216,17 @@ class GrokBot(commands.Bot):
             "tool_call_id": tool_call_id or "unknown"
         }
 
-    def build_messages(self, user_input: str, user_id: int) -> List[Dict]:
+    async def build_messages(self, user_input: str, user_id: int) -> List[Dict]:
         """Build message array with proper history including tool calls."""
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Fetch user profile and inject into system prompt if it exists
+        system_content = SYSTEM_PROMPT
+        profile_data = await database.get_profile(user_id)
+        if profile_data and profile_data.get("profile_text"):
+            system_content += f"\n\n--- User Context ---\n{profile_data['profile_text']}"
+
+        messages = [{"role": "system", "content": system_content}]
         history = self.conversation_history[user_id]
-        total_chars = len(SYSTEM_PROMPT) + len(user_input)
+        total_chars = len(system_content) + len(user_input)
 
         # Add history messages, respecting character limit
         for msg in list(history):
@@ -260,6 +273,9 @@ async def on_message(message: discord.Message):
     if not bot.user or message.author == bot.user:
         return
 
+    # Process commands first (for !profile, !regenerate, !forget, etc.)
+    await bot.process_commands(message)
+
     # Debug command - now shows YOUR personal history
     if message.content.strip().lower() == '!history':
         history = bot.conversation_history[message.author.id]
@@ -304,7 +320,7 @@ async def on_message(message: discord.Message):
     logger.info(f"Processing: {message.author} -> {user_input[:100]}")
     start_time = asyncio.get_event_loop().time()
 
-    messages = bot.build_messages(user_input, message.author.id)
+    messages = await bot.build_messages(user_input, message.author.id)
 
     async with message.channel.typing():
         try:
@@ -382,10 +398,129 @@ async def on_message(message: discord.Message):
                     if msg["role"] in ["assistant", "tool"]:
                         history.append(msg)
 
+                # Persist messages to database
+                user_id = message.author.id
+                await database.save_message(user_id, "user", content=user_input)
+                for msg in messages[messages.index({"role": "user", "content": user_input}) + 1:]:
+                    if msg["role"] == "assistant":
+                        await database.save_message(
+                            user_id, "assistant",
+                            content=msg.get("content"),
+                            tool_calls=msg.get("tool_calls")
+                        )
+                    elif msg["role"] == "tool":
+                        await database.save_message(
+                            user_id, "tool",
+                            content=msg.get("content"),
+                            tool_call_id=msg.get("tool_call_id")
+                        )
+
+                # Check if we should regenerate the user's profile
+                if await database.should_regenerate_profile(user_id):
+                    logger.info(f"Triggering profile regeneration for user {user_id}")
+                    asyncio.create_task(regenerate_profile_for_user(user_id, bot.session))
+
         except Exception as e:
             logger.error(f"Unexpected error: {e}", exc_info=True)
             await message.channel.send(
                 "Sorry, I encountered an unexpected error. Please try again.")
+
+
+async def regenerate_profile_for_user(
+    user_id: int,
+    session: Optional[aiohttp.ClientSession] = None
+) -> Optional[str]:
+    """Helper function to regenerate a user's profile."""
+    try:
+        messages = await database.get_user_messages(user_id)
+        if not messages:
+            return None
+
+        profile_text = await profile_generator.generate_user_profile(
+            user_id, messages, session
+        )
+        if profile_text:
+            msg_count = await database.get_user_message_count(user_id)
+            await database.save_profile(user_id, profile_text, msg_count)
+            return profile_text
+        return None
+    except Exception as e:
+        logger.error(f"Error regenerating profile for user {user_id}: {e}")
+        return None
+
+
+@bot.command(name='profile')
+async def show_profile(ctx: commands.Context):
+    """Show your current user profile."""
+    profile_data = await database.get_profile(ctx.author.id)
+    if profile_data and profile_data.get("profile_text"):
+        msg_count = await database.get_user_message_count(ctx.author.id)
+        await ctx.send(
+            f"**Profile for {ctx.author.display_name}**\n"
+            f"(Based on {profile_data['message_count']} messages, "
+            f"updated: {profile_data['last_updated']})\n\n"
+            f"{profile_data['profile_text']}"
+        )
+    else:
+        msg_count = await database.get_user_message_count(ctx.author.id)
+        if msg_count > 0:
+            await ctx.send(
+                f"No profile yet for {ctx.author.display_name}.\n"
+                f"You have {msg_count} messages stored. "
+                f"Use `!regenerate` to generate your profile."
+            )
+        else:
+            await ctx.send(
+                f"No profile yet for {ctx.author.display_name}.\n"
+                f"Start chatting with me to build your profile!"
+            )
+
+
+@bot.command(name='regenerate')
+async def regenerate_profile(ctx: commands.Context):
+    """Force regenerate your user profile."""
+    msg_count = await database.get_user_message_count(ctx.author.id)
+    if msg_count < 5:
+        await ctx.send(
+            f"Not enough conversation history yet ({msg_count} messages). "
+            f"Chat with me more before generating a profile!"
+        )
+        return
+
+    status_msg = await ctx.send("Generating your profile...")
+
+    profile_text = await regenerate_profile_for_user(ctx.author.id, bot.session)
+
+    if profile_text:
+        await status_msg.edit(
+            content=f"**Updated Profile for {ctx.author.display_name}**\n\n{profile_text}"
+        )
+    else:
+        await status_msg.edit(content="Failed to generate profile. Please try again later.")
+
+
+@bot.command(name='forget')
+async def forget_user_data(ctx: commands.Context):
+    """Delete all your stored data (messages and profile)."""
+    msg_count = await database.get_user_message_count(ctx.author.id)
+    profile = await database.get_profile(ctx.author.id)
+
+    if msg_count == 0 and not profile:
+        await ctx.send("You don't have any stored data to delete.")
+        return
+
+    await database.delete_user_data(ctx.author.id)
+
+    # Also clear in-memory conversation history
+    if ctx.author.id in bot.conversation_history:
+        bot.conversation_history[ctx.author.id].clear()
+
+    await ctx.send(
+        f"All your data has been deleted:\n"
+        f"- {msg_count} messages removed\n"
+        f"- Profile {'removed' if profile else 'was not present'}\n\n"
+        f"Your conversation history has been cleared."
+    )
 
 
 # --- KEEP-ALIVE WEB SERVER ---
