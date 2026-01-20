@@ -115,6 +115,7 @@ class GrokBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix='!', intents=intents)
         self.session: Optional[aiohttp.ClientSession] = None
+        # Changed from channel-based to user-based history tracking
         self.conversation_history: Dict[int, deque] = defaultdict(
             lambda: deque(maxlen=MAX_HISTORY))
         self.processed_messages: deque = deque(maxlen=200)
@@ -208,10 +209,10 @@ class GrokBot(commands.Bot):
             "tool_call_id": tool_call_id or "unknown"
         }
 
-    def build_messages(self, user_input: str, channel_id: int) -> List[Dict]:
+    def build_messages(self, user_input: str, user_id: int) -> List[Dict]:
         """Build message array with proper history including tool calls."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        history = self.conversation_history[channel_id]
+        history = self.conversation_history[user_id]
         total_chars = len(SYSTEM_PROMPT) + len(user_input)
 
         # Add history messages, respecting character limit
@@ -259,9 +260,9 @@ async def on_message(message: discord.Message):
     if not bot.user or message.author == bot.user:
         return
 
-    # Debug command
+    # Debug command - now shows YOUR personal history
     if message.content.strip().lower() == '!history':
-        history = bot.conversation_history[message.channel.id]
+        history = bot.conversation_history[message.author.id]
         count = len(history)
 
         # Count different message types
@@ -270,10 +271,19 @@ async def on_message(message: discord.Message):
         tool_msgs = sum(1 for m in history if m.get("role") == "tool")
 
         await message.channel.send(
-            f"📊 **History Stats**\n"
+            f"📊 **Your History Stats** ({message.author.display_name})\n"
             f"Total messages: {count}/{MAX_HISTORY}\n"
             f"User: {user_msgs} | Assistant: {assistant_msgs} | Tool: {tool_msgs}"
         )
+        return
+
+    # Clear command - reset YOUR conversation history
+    if message.content.strip().lower() == '!clear':
+        if message.author.id in bot.conversation_history:
+            bot.conversation_history[message.author.id].clear()
+            await message.channel.send(f"✅ Cleared conversation history for {message.author.display_name}")
+        else:
+            await message.channel.send(f"You don't have any conversation history yet!")
         return
 
     if not bot.user.mentioned_in(message):
@@ -294,7 +304,7 @@ async def on_message(message: discord.Message):
     logger.info(f"Processing: {message.author} -> {user_input[:100]}")
     start_time = asyncio.get_event_loop().time()
 
-    messages = bot.build_messages(user_input, message.channel.id)
+    messages = bot.build_messages(user_input, message.author.id)
 
     async with message.channel.typing():
         try:
@@ -358,7 +368,8 @@ async def on_message(message: discord.Message):
                 await message.channel.send(reply)
 
                 # Update history with COMPLETE conversation including tool calls
-                history = bot.conversation_history[message.channel.id]
+                # Now using user-specific history instead of channel-based
+                history = bot.conversation_history[message.author.id]
 
                 # Save the user's input
                 history.append({"role": "user", "content": user_input})
