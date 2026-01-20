@@ -59,9 +59,9 @@ Your capabilities and tool usage:
 Be genuinely helpful while being entertaining and a bit irreverent."""
 
 MAX_HISTORY = 10
-MAX_REPLY_TOKENS = 800  # Increased for more complete responses
+MAX_REPLY_TOKENS = 400  # Reduced for faster responses
 MAX_PAYLOAD_CHARS = 8000
-MAX_TOOL_ITERATIONS = 5
+MAX_TOOL_ITERATIONS = 3  # Reduced to prevent long chains
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -120,7 +120,7 @@ class GrokBot(commands.Bot):
         self.processed_messages: deque = deque(maxlen=200)
 
     async def setup_hook(self) -> None:
-        self.session = aiohttp.ClientSession(timeout=ClientTimeout(total=180))
+        self.session = aiohttp.ClientSession(timeout=ClientTimeout(total=30))
         logger.info("Aiohttp session created for Grok API calls")
         if not DDGS_AVAILABLE:
             logger.warning("Web search disabled - ddgs not installed")
@@ -151,11 +151,11 @@ class GrokBot(commands.Bot):
 
             def search():
                 with DDGS() as ddgs:
-                    return list(ddgs.text(query, max_results=5))
+                    return list(ddgs.text(query, max_results=3))
 
             results = await asyncio.wait_for(loop.run_in_executor(
                 None, search),
-                                             timeout=12.0)
+                                             timeout=6.0)
             if not results:
                 return "No results found."
             formatted = "\n\n".join(
@@ -292,6 +292,7 @@ async def on_message(message: discord.Message):
         return
 
     logger.info(f"Processing: {message.author} -> {user_input[:100]}")
+    start_time = asyncio.get_event_loop().time()
 
     messages = bot.build_messages(user_input, message.channel.id)
 
@@ -349,6 +350,11 @@ async def on_message(message: discord.Message):
             if reply:
                 if len(reply) > 2000:
                     reply = reply[:1997] + "..."
+
+                # Log response time
+                elapsed = asyncio.get_event_loop().time() - start_time
+                logger.info(f"Response generated in {elapsed:.2f}s")
+
                 await message.channel.send(reply)
 
                 # Update history with COMPLETE conversation including tool calls
